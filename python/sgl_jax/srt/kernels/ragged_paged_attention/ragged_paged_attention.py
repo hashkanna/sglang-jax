@@ -1457,6 +1457,7 @@ def ragged_paged_attention(
             causal=causal,
             sm_scale=sm_scale,
             sliding_window=sliding_window,
+            attention_sink=attention_sink,
             soft_cap=soft_cap,
             mask_value=mask_value,
             q_scale=q_scale,

@@ -427,9 +427,11 @@ class LogitsProcessor(nnx.Module):
 
         return jnp.array(input_token_ids_logprobs_val), jnp.array(input_token_ids_logprobs_idx)
 
-    @staticmethod
-    def get_top_logprobs(all_logprobs: jax.Array, logits_metadata: LogitsMetadata):
+    def get_top_logprobs(self, all_logprobs: jax.Array, logits_metadata: LogitsMetadata):
         max_k = max(logits_metadata.top_logprobs_nums)
+        # Replicate to avoid sharding along vocab axis before top_k
+        replicated = NamedSharding(self.mesh, P(None))
+        all_logprobs = jax.sharding.reshard(all_logprobs, replicated)
         values, indices = jax.lax.top_k(all_logprobs, max_k)
 
         input_top_logprobs_val, input_top_logprobs_idx = [], []
