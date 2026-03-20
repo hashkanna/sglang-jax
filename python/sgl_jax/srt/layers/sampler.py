@@ -1,3 +1,6 @@
+import logging
+import math
+import os
 import jax
 import numpy as np
 from flax import nnx
@@ -13,6 +16,10 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+
+def _debug_sampler_logprobs_slice_enabled() -> bool:
+    return os.getenv("SGL_DEBUG_SAMPLER_LOGPROBS_SLICE") == "1"
 
 
 class Sampler(nnx.Module):
@@ -197,6 +204,25 @@ class Sampler(nnx.Module):
             regular_fn,
             operands,
         )
+        if _debug_sampler_logprobs_slice_enabled():
+            try:
+                lp_slice = logprobs[:1, :8] if logprobs.ndim > 1 else logprobs[:8]
+                jax.debug.print(
+                    "SAMPLER logprobs slice shape={s} min={mn} max={mx} "
+                    "mean={mean} std={std} nan={nan} inf={inf} slice={sl}",
+                    s=lp_slice.shape,
+                    mn=jnp.nanmin(lp_slice),
+                    mx=jnp.nanmax(lp_slice),
+                    mean=jnp.mean(lp_slice),
+                    std=jnp.std(lp_slice),
+                    nan=jnp.isnan(lp_slice).sum(),
+                    inf=jnp.isinf(lp_slice).sum(),
+                    sl=lp_slice,
+                )
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "SAMPLER logprobs slice logging failed: %s", e
+                )
 
         logprob_operands = (
             logits_output,
