@@ -212,6 +212,8 @@ class Sampler(nnx.Module):
 
 
 def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int], mesh: Mesh | None):
+    import logging
+    logger = logging.getLogger(__name__)
     max_k = max(top_logprobs_nums)
 
     # On TP-sharded vocab axes, top_k output inherits sharding. If k is not divisible by
@@ -228,14 +230,25 @@ def get_top_logprobs(logprobs: jax.Array, top_logprobs_nums: list[int], mesh: Me
     # Ensure output is replicated if mesh is provided, to match downstream expectations.
     # Also needed before slicing back to max_k when aligned_k > max_k, because slicing a
     # TP-sharded dimension to a non-divisible size is not implemented.
+    replicated = None
     if mesh is not None:
         replicated = NamedSharding(mesh, P(*([None] * values.ndim)))
-        values = jax.sharding.reshard(values, replicated)
-        indices = jax.sharding.reshard(indices, replicated)
+    already_replicated = False
+    if replicated is not None:
+        try:
+            values = jax.sharding.reshard(values, replicated)
+            indices = jax.sharding.reshard(indices, replicated)
+            already_replicated = True
+        except Exception as e:
+            # Fallback if resharding fails (e.g. inside strict shard_map), though top_k output 
+            # should generally be manageable.
+            logger.warning("Failed to reshard top_k output to replicated: %s", e)
 
     if aligned_k != max_k:
         values = values[..., :max_k]
         indices = indices[..., :max_k]
+
+    values = jnp.nan_to_num(values, neginf=-jnp.inf, posinf=jnp.inf)
 
     batch_size = len(top_logprobs_nums)
     padded_vals = jnp.full((batch_size, max_k), -jnp.inf, dtype=values.dtype)
