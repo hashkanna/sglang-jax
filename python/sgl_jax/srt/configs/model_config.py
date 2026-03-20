@@ -207,14 +207,6 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
 
-        self.moe_quant_block_size = 256
-        if self.quantization_config and self.quantization_config.weight_block_size:
-            if isinstance(self.quantization_config.weight_block_size, list):
-                self.moe_quant_block_size = self.quantization_config.weight_block_size[0]
-            else:
-                self.moe_quant_block_size = self.quantization_config.weight_block_size
-        self.hf_config.moe_quant_block_size = self.moe_quant_block_size
-
         config = self.hf_config
 
         # multimodal

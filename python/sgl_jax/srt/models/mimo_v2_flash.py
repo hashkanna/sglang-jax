@@ -266,7 +266,12 @@ class MiMoV2Moe(nnx.Module):
             # For static checkpoints with 128-block quant, we let the upper-layer
             # adaptation pass requantize weights/scales to 256 first, then this value
             # will be updated there. For non-static/online quantization, keep forcing 256.
-            moe_quant_block_size = getattr(config, "moe_quant_block_size", 256)
+            qc = self.quantization_config
+            moe_quant_block_size = (
+                qc.weight_block_size[0]
+                if qc is not None and qc.weight_block_size is not None
+                else 256
+            )
             is_static_quant_ckpt = bool(
                 self.quantization_config is not None
                 and getattr(self.quantization_config, "is_static_checkpoint", False)
@@ -1011,7 +1016,12 @@ class MiMoV2FlashForCausalLM(nnx.Module):
             num_experts = _get_mimo_num_experts(self.config)
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
             moe_intermediate_size = getattr(self.config, "moe_intermediate_size", self.config.intermediate_size)
-            moe_quant_block_size = getattr(model_config, "moe_quant_block_size", 256)
+            qc = model_config.quantization_config
+            moe_quant_block_size = (
+                qc.weight_block_size[0]
+                if qc is not None and qc.weight_block_size is not None
+                else 256
+            )
 
             moe_mappings = create_moe_weights_mapping_quantized(
                 prefix=prefix,

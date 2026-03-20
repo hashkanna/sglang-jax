@@ -1472,6 +1472,11 @@ def ragged_paged_attention(
         )
 
     # Fused path
+    # TODO: implement attention_sink support in fused kernel (currently only split path supports it)
+    assert attention_sink is None, (
+        "attention_sink is not supported in fused ragged_paged_attention. "
+        "Use split KV cache path instead."
+    )
     q, k, v = queries, keys, values
     static_validate_inputs_fused(
         q,
