@@ -220,13 +220,14 @@ def should_use_blockwise_kernel(
     out_dim: int,
     block_size_out: int,
 ) -> bool:
-    """Guard known-bad narrow-N TPU blockwise cases.
+    """Return whether the TPU blockwise kernel is valid for the local N size.
 
-    When a tensor-parallel column shard collapses to a single output block
-    (for example local N=128 with block_size_out=128), the TPU blockwise
-    kernel can produce NaNs on Qwen3-MoE k/v projections.
+    We still reject partial single-block outputs (``out_dim < block_size_out``),
+    because the tuned blockwise path assumes at least one full output block.
+    An exact single block (for example ``out_dim=128`` with
+    ``block_size_out=128``) is allowed.
     """
-    return out_dim > block_size_out
+    return out_dim >= block_size_out
 
 
 def expand_block_scale(

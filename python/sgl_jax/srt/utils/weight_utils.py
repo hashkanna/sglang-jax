@@ -291,6 +291,22 @@ class WeightLoader:
         )
 
         n_out = int(model_param.value.shape[2])
+        expected_out_blocks = math.ceil(n_out / block_size_out)
+        channel_to_block = None
+        if weight.shape[0] != expected_out_blocks:
+            channel_to_block = self._maybe_build_qkv_channel_to_block(
+                target_path=target_path,
+                n_out=n_out,
+                scale_rows=int(weight.shape[0]),
+                block_size_out=block_size_out,
+            )
+            if channel_to_block is None:
+                raise ValueError(
+                    "Cannot expand 2D block-quant scale with non-uniform output blocks: "
+                    f"path={target_path}, scale_shape={weight.shape}, n_out={n_out}, "
+                    f"expected_uniform_out_blocks={expected_out_blocks}."
+                )
+
         logger.info(
             "Expanding linear block-quant scale %s from %s to kernel-ready layout [%d, 1, %d]",
             target_path,
@@ -298,7 +314,113 @@ class WeightLoader:
             weight.shape[1],
             n_out,
         )
-        return expand_block_scale(weight, n_out, block_size_out)
+        return expand_block_scale(
+            weight,
+            n_out,
+            block_size_out,
+            channel_to_block=channel_to_block,
+        )
+
+    def _maybe_build_qkv_channel_to_block(
+        self,
+        target_path: str,
+        n_out: int,
+        scale_rows: int,
+        block_size_out: int,
+    ) -> jax.Array | None:
+        """Build an explicit per-channel block map for Q/K/V scale expansion.
+
+        Some checkpoints store Q/K/V block scales in a per-head layout instead of
+        a globally uniform ``ceil(n_out / block_size_out)`` layout. For example,
+        MiMo-V2-Flash K projection uses ``head_dim=192`` with ``block_size=128``,
+        so each head contributes two scale rows:
+
+        - row 0 -> channels 0..127
+        - row 1 -> channels 128..191
+
+        and then the pattern resets for the next head. When we pre-expand to the
+        global kernel-ready ``[in_blocks, 1, n_out]`` layout at load time, we need
+        an explicit ``channel_to_block`` map to preserve those per-head boundaries.
+        """
+        proj_layout = self._get_qkv_projection_layout(target_path)
+        if proj_layout is None:
+            return None
+
+        num_heads, head_dim = proj_layout
+        if num_heads <= 0 or head_dim <= 0:
+            return None
+        if n_out != num_heads * head_dim:
+            return None
+
+        blocks_per_head = math.ceil(head_dim / block_size_out)
+        if scale_rows != num_heads * blocks_per_head:
+            return None
+
+        channels = np.arange(n_out, dtype=np.int32)
+        head_ids = channels // head_dim
+        head_offsets = channels % head_dim
+        block_in_head = np.minimum(head_offsets // block_size_out, blocks_per_head - 1)
+        channel_to_block = head_ids * blocks_per_head + block_in_head
+        return jnp.asarray(channel_to_block, dtype=jnp.int32)
+
+    def _get_qkv_projection_layout(self, target_path: str) -> tuple[int, int] | None:
+        """Infer the global (num_heads, head_dim) layout for Q/K/V projection scales."""
+        layer_idx = None
+        match = re.search(r"(?:^|[./])layers[.\[](\d+)[\].]", target_path)
+        if match is not None:
+            layer_idx = int(match.group(1))
+
+        text_config = getattr(self.model_config, "hf_text_config", self.model_config)
+        is_swa_layer = False
+        if layer_idx is not None:
+            hybrid_layer_pattern = getattr(text_config, "hybrid_layer_pattern", None)
+            if hybrid_layer_pattern is not None and 0 <= layer_idx < len(hybrid_layer_pattern):
+                is_swa_layer = hybrid_layer_pattern[layer_idx] == 1
+            else:
+                hybrid_pattern = getattr(text_config, "hybrid_pattern", None)
+                if hybrid_pattern and 0 <= layer_idx < len(hybrid_pattern):
+                    is_swa_layer = hybrid_pattern[layer_idx] == "swa"
+
+        base_head_dim = int(getattr(self.model_config, "head_dim", self.head_dim))
+        base_v_head_dim = int(getattr(self.model_config, "v_head_dim", base_head_dim))
+        head_dim = (
+            int(getattr(text_config, "swa_head_dim", base_head_dim))
+            if is_swa_layer
+            else base_head_dim
+        )
+        v_head_dim = (
+            int(getattr(text_config, "swa_v_head_dim", head_dim))
+            if is_swa_layer
+            else base_v_head_dim
+        )
+
+        if "self_attn.q_proj.weight_scale" in target_path:
+            num_heads = (
+                int(getattr(text_config, "swa_num_attention_heads", self.num_heads))
+                if is_swa_layer
+                else int(getattr(self.model_config, "num_attention_heads", self.num_heads))
+            )
+            return num_heads, head_dim
+
+        if "self_attn.k_proj.weight_scale" in target_path:
+            if hasattr(self.model_config, "get_kv_head_counts_for_layer"):
+                _, total_kv_heads = self.model_config.get_kv_head_counts_for_layer(
+                    layer_idx, self.sharding_size
+                )
+            else:
+                total_kv_heads = self.model_config.get_total_num_kv_heads()
+            return int(total_kv_heads), head_dim
+
+        if "self_attn.v_proj.weight_scale" in target_path:
+            if hasattr(self.model_config, "get_kv_head_counts_for_layer"):
+                _, total_kv_heads = self.model_config.get_kv_head_counts_for_layer(
+                    layer_idx, self.sharding_size
+                )
+            else:
+                total_kv_heads = self.model_config.get_total_num_kv_heads()
+            return int(total_kv_heads), v_head_dim
+
+        return None
 
     def _scan_weight_info(self) -> dict[str, list[dict]]:
         """

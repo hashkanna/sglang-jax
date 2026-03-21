@@ -11,9 +11,13 @@ from jax.sharding import Mesh
 
 import sgl_jax.srt.kernels.quantized_matmul.blockwise_utils as blockwise_utils
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
-from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import expand_block_scale
+from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
+    expand_block_scale,
+    should_use_blockwise_kernel,
+)
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
 from sgl_jax.srt.layers.linear import LinearBase, QuantizedLinear
+from sgl_jax.srt.utils.weight_utils import WeightLoader
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     apply_linear_quantization,
     quantize_tensor,
@@ -146,6 +150,11 @@ def test_xla_quantized_matmul_block_quant_all():
 
     if hasattr(jnp, "float8_e4m3fn"):
         _run_block_quant_kernel_test(jnp.float8_e4m3fn, "FP8_E4M3")
+
+
+def test_should_use_blockwise_kernel_allows_exact_output_block():
+    assert should_use_blockwise_kernel(out_dim=128, block_size_out=128)
+    assert not should_use_blockwise_kernel(out_dim=64, block_size_out=128)
 
 
 def _assert_blockwise_tuning_fallback_uses_compatible_seed():
@@ -620,6 +629,82 @@ def _make_non_aligned_block_quant_inputs(out_dim, in_dim, weight_dtype):
     )
     w_q = w_q_padded[:out_dim, :in_dim]
     return x, w_fp, w_q, w_scale, compute_dtype
+
+
+def test_expand_block_scale_with_explicit_per_head_block_map():
+    scale = jnp.asarray([[1.0], [2.0], [3.0], [4.0]], dtype=jnp.float32)
+    channel_to_block = jnp.asarray(
+        np.concatenate(
+            [
+                np.full(128, 0, dtype=np.int32),
+                np.full(64, 1, dtype=np.int32),
+                np.full(128, 2, dtype=np.int32),
+                np.full(64, 3, dtype=np.int32),
+            ]
+        )
+    )
+
+    expanded = expand_block_scale(
+        scale,
+        n_out=384,
+        block_size_out=128,
+        channel_to_block=channel_to_block,
+    )
+
+    assert expanded.shape == (1, 1, 384)
+    np.testing.assert_array_equal(
+        np.asarray(expanded[0, 0, [0, 127, 128, 191, 192, 319, 320, 383]]),
+        np.asarray([1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0], dtype=np.float32),
+    )
+
+
+def test_weight_loader_expands_k_proj_scale_with_per_head_blocks():
+    class FakeQuantConfig:
+        weight_block_size = (128, 128)
+
+    class FakeTextConfig:
+        hybrid_layer_pattern = [0]
+        num_attention_heads = 2
+        num_key_value_heads = 2
+        head_dim = 192
+        v_head_dim = 128
+
+    class FakeModelConfig:
+        num_attention_heads = 2
+        num_key_value_heads = 2
+        hidden_size = 384
+        head_dim = 192
+        v_head_dim = 128
+        quantization_config = FakeQuantConfig()
+        hf_text_config = FakeTextConfig()
+
+        def get_total_num_kv_heads(self):
+            return 2
+
+        def get_kv_head_counts_for_layer(self, layer_idx, tensor_parallel_size=None):
+            del layer_idx, tensor_parallel_size
+            return 2, 2
+
+    mesh = _create_single_device_mesh()
+    loader = WeightLoader(model=None, model_config=FakeModelConfig(), mesh=mesh)
+    scale = jnp.asarray([[1.0], [2.0], [3.0], [4.0]], dtype=jnp.float32)
+    fake_param = type(
+        "FakeParam",
+        (),
+        {"value": jnp.zeros((1, 1, 384), dtype=jnp.float32)},
+    )()
+
+    expanded = loader._maybe_expand_linear_block_scale(
+        scale,
+        fake_param,
+        "model.layers.0.self_attn.k_proj.weight_scale",
+    )
+
+    assert expanded.shape == (1, 1, 384)
+    np.testing.assert_array_equal(
+        np.asarray(expanded[0, 0, [0, 127, 128, 191, 192, 319, 320, 383]]),
+        np.asarray([1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0], dtype=np.float32),
+    )
 
 
 def test_quantized_linear_block_quant_non_aligned_192():
