@@ -352,15 +352,24 @@ class WeightLoader:
         if n_out != num_heads * head_dim:
             return None
 
+        if scale_rows % num_heads != 0:
+            return None
+        rows_per_head = scale_rows // num_heads
         blocks_per_head = math.ceil(head_dim / block_size_out)
-        if scale_rows != num_heads * blocks_per_head:
+        if rows_per_head not in (1, blocks_per_head):
             return None
 
         channels = np.arange(n_out, dtype=np.int32)
         head_ids = channels // head_dim
-        head_offsets = channels % head_dim
-        block_in_head = np.minimum(head_offsets // block_size_out, blocks_per_head - 1)
-        channel_to_block = head_ids * blocks_per_head + block_in_head
+        if rows_per_head == 1:
+            # Some MiMo K-proj shards land on the conservative per-head scale path in
+            # _apply_kv_head_padding(), which intentionally collapses all channels of a
+            # head to one scale row. Preserve that exact semantics here.
+            channel_to_block = head_ids
+        else:
+            head_offsets = channels % head_dim
+            block_in_head = np.minimum(head_offsets // block_size_out, blocks_per_head - 1)
+            channel_to_block = head_ids * blocks_per_head + block_in_head
         return jnp.asarray(channel_to_block, dtype=jnp.int32)
 
     def _get_qkv_projection_layout(self, target_path: str) -> tuple[int, int] | None:

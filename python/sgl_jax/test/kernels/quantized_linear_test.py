@@ -707,6 +707,55 @@ def test_weight_loader_expands_k_proj_scale_with_per_head_blocks():
     )
 
 
+def test_weight_loader_expands_k_proj_scale_with_single_row_per_head():
+    class FakeQuantConfig:
+        weight_block_size = (128, 128)
+
+    class FakeTextConfig:
+        hybrid_layer_pattern = [0]
+        num_attention_heads = 2
+        num_key_value_heads = 2
+        head_dim = 192
+        v_head_dim = 128
+
+    class FakeModelConfig:
+        num_attention_heads = 2
+        num_key_value_heads = 2
+        hidden_size = 384
+        head_dim = 192
+        v_head_dim = 128
+        quantization_config = FakeQuantConfig()
+        hf_text_config = FakeTextConfig()
+
+        def get_total_num_kv_heads(self):
+            return 2
+
+        def get_kv_head_counts_for_layer(self, layer_idx, tensor_parallel_size=None):
+            del layer_idx, tensor_parallel_size
+            return 2, 2
+
+    mesh = _create_single_device_mesh()
+    loader = WeightLoader(model=None, model_config=FakeModelConfig(), mesh=mesh)
+    scale = jnp.asarray([[1.0], [2.0]], dtype=jnp.float32)
+    fake_param = type(
+        "FakeParam",
+        (),
+        {"value": jnp.zeros((1, 1, 384), dtype=jnp.float32)},
+    )()
+
+    expanded = loader._maybe_expand_linear_block_scale(
+        scale,
+        fake_param,
+        "model.layers.0.self_attn.k_proj.weight_scale",
+    )
+
+    assert expanded.shape == (1, 1, 384)
+    np.testing.assert_array_equal(
+        np.asarray(expanded[0, 0, [0, 127, 128, 191, 192, 319, 320, 383]]),
+        np.asarray([1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0], dtype=np.float32),
+    )
+
+
 def test_quantized_linear_block_quant_non_aligned_192():
     """QuantizedLinear with out_dim=192, block_size=(128,128) — partial second block."""
     mesh = _create_single_device_mesh()
